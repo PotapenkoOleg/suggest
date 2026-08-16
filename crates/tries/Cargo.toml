@@ -1,0 +1,9 @@
+[package]
+name = "tries"
+authors = ["Oleg Potapenko"]
+version = "1.0.0"
+license = "MIT"
+description = "String-keyed symbol tables - ternary search trie and Patricia trie behind shared traits"
+edition = "2024"
+
+[dependencies]
