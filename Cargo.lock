@@ -1240,6 +1240,7 @@ dependencies = [
  "anyhow",
  "rayon",
  "serde",
+ "serde_json",
  "tokio",
  "tries",
  "utoipa",

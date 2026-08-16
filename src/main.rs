@@ -11,6 +11,9 @@ type Tries = SharedTrieMap<u32>;
 /// The trie used by requests that name no other one.
 const DEFAULT_TRIE: &str = "default";
 
+/// Where the suggest endpoint is served from.
+const SUGGEST_PATH: &str = "/api/v1/suggest";
+
 /// How many suggestions a request gets when it asks for no particular number.
 const DEFAULT_LIMIT: usize = 10;
 
@@ -49,12 +52,18 @@ async fn index() -> HttpResponse {
 struct SuggestQuery {
     /// Prefix to complete. An empty prefix matches every word.
     q: String,
-    /// Most suggestions to return. Defaults to [`DEFAULT_LIMIT`].
+    /// Which trie to search. Defaults to [`DEFAULT_TRIE`].
+    scope: Option<String>,
+    /// Most suggestions to return. Defaults to [`DEFAULT_LIMIT`], capped at
+    /// [`MAX_LIMIT`].
     limit: Option<usize>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct SuggestResponse {
+    /// The trie that answered, which is the default one when the request named
+    /// no scope.
+    scope: String,
     /// The prefix that was searched for.
     query: String,
     /// Matching words, in lexicographic order.
@@ -66,18 +75,27 @@ struct SuggestResponse {
     path = "/api/v1/suggest",
     params(SuggestQuery),
     responses(
-        (status = 200, description = "Words in the default trie starting with the prefix", body = SuggestResponse),
+        (status = 200, description = "Words in the scoped trie starting with the prefix", body = SuggestResponse),
+        (status = 404, description = "No trie is registered under that scope"),
         (status = 500, description = "The default trie is not registered"),
     )
 )]
 async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> HttpResponse {
-    let Some(trie) = tries.get(DEFAULT_TRIE) else {
-        // Seeded at startup, so its absence is a server-side fault rather than
-        // a query that simply matched nothing
-        return HttpResponse::InternalServerError().body("no default trie");
+    let scope = query.scope.as_deref().unwrap_or(DEFAULT_TRIE);
+
+    // Deliberately not `get_or_create`: that would let any request register a
+    // trie under a name of its choosing, growing the map without bound
+    let Some(trie) = tries.get(scope) else {
+        return if scope == DEFAULT_TRIE {
+            // Seeded at startup, so its absence is a server-side fault rather
+            // than a query that simply named the wrong trie
+            HttpResponse::InternalServerError().body("no default trie")
+        } else {
+            HttpResponse::NotFound().body(format!("unknown scope: {scope}"))
+        };
     };
 
-    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     // The read guard is taken and dropped inside this statement: never held
     // across an `.await`, and never blocking a writer for longer than the scan
     let suggestions: Vec<String> = trie
@@ -89,6 +107,7 @@ async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> Ht
         .collect();
 
     HttpResponse::Ok().json(SuggestResponse {
+        scope: scope.to_string(),
         query: query.q.clone(),
         suggestions,
     })
@@ -97,7 +116,7 @@ async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> Ht
 /// Registers the routes. Shared with the tests so they exercise the real ones.
 fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/", web::get().to(index))
-        .route("/suggest", web::get().to(suggest));
+        .route(SUGGEST_PATH, web::get().to(suggest));
 }
 
 #[actix_web::main]
@@ -144,10 +163,35 @@ mod tests {
         assert_eq!(trie.get("sea"), Some(0));
     }
 
+    // The running service seeds only the default trie, so the scopes a request
+    // can select are registered here instead.
+    fn test_tries() -> Tries {
+        let tries = build_tries();
+
+        let fruit = tries.get_or_create("fruit");
+        {
+            let mut trie = fruit.write().unwrap();
+            for (rank, word) in ["apple", "apricot", "shallot"].iter().enumerate() {
+                trie.put(word.to_string(), rank as u32);
+            }
+        }
+
+        // More words than `MAX_LIMIT`, so a request cannot ask for them all
+        let bulk = tries.get_or_create("bulk");
+        {
+            let mut trie = bulk.write().unwrap();
+            for i in 0..(MAX_LIMIT * 2) {
+                trie.put(format!("word-{i:04}"), i as u32);
+            }
+        }
+
+        tries
+    }
+
     async fn get(uri: &str) -> (StatusCode, String) {
         let app = actix_test::init_service(
             App::new()
-                .app_data(web::Data::new(build_tries()))
+                .app_data(web::Data::new(test_tries()))
                 .configure(configure),
         )
         .await;
@@ -162,42 +206,89 @@ mod tests {
 
     #[actix_web::test]
     async fn suggest_returns_matches_for_a_prefix() {
-        let (status, body) = get("/suggest?q=sh").await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, r#"{"query":"sh","suggestions":["shell","shore"]}"#);
-    }
-
-    #[actix_web::test]
-    async fn suggest_returns_every_word_for_an_empty_prefix() {
-        let (status, body) = get("/suggest?q=").await;
+        let (status, body) = get("/api/v1/suggest?q=sh").await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body,
-            r#"{"query":"","suggestions":["sea","shell","shore"]}"#
+            r#"{"scope":"default","query":"sh","suggestions":["shell","shore"]}"#
+        );
+    }
+
+    #[actix_web::test]
+    async fn suggest_searches_the_requested_scope() {
+        // The same prefix, answered by a different trie
+        let (status, body) = get("/api/v1/suggest?q=sh&scope=fruit").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"fruit","query":"sh","suggestions":["shallot"]}"#
+        );
+    }
+
+    #[actix_web::test]
+    async fn suggest_falls_back_to_the_default_scope() {
+        let (_, without_scope) = get("/api/v1/suggest?q=s").await;
+        let (_, with_scope) = get("/api/v1/suggest?q=s&scope=default").await;
+
+        assert_eq!(without_scope, with_scope);
+    }
+
+    #[actix_web::test]
+    async fn suggest_rejects_an_unknown_scope() {
+        let (status, body) = get("/api/v1/suggest?q=s&scope=nope").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "unknown scope: nope");
+    }
+
+    #[actix_web::test]
+    async fn suggest_returns_every_word_for_an_empty_prefix() {
+        let (status, body) = get("/api/v1/suggest?q=").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"","suggestions":["sea","shell","shore"]}"#
         );
     }
 
     #[actix_web::test]
     async fn suggest_matches_nothing_outside_the_trie() {
-        let (status, body) = get("/suggest?q=zebra").await;
+        let (status, body) = get("/api/v1/suggest?q=zebra").await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, r#"{"query":"zebra","suggestions":[]}"#);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"zebra","suggestions":[]}"#
+        );
     }
 
     #[actix_web::test]
     async fn suggest_honours_the_limit() {
-        let (status, body) = get("/suggest?q=s&limit=1").await;
+        let (status, body) = get("/api/v1/suggest?q=s&limit=1").await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, r#"{"query":"s","suggestions":["sea"]}"#);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"s","suggestions":["sea"]}"#
+        );
+    }
+
+    #[actix_web::test]
+    async fn suggest_caps_the_limit() {
+        let (status, body) = get("/api/v1/suggest?q=word&scope=bulk&limit=100000").await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["suggestions"].as_array().unwrap().len(), MAX_LIMIT);
     }
 
     #[actix_web::test]
     async fn suggest_rejects_a_missing_query() {
-        let (status, _) = get("/suggest").await;
+        let (status, _) = get("/api/v1/suggest").await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
