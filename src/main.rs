@@ -1,29 +1,26 @@
+use std::string::ToString;
 use actix_web::{App, HttpResponse, HttpServer, web};
 use serde::Serialize;
 use tries::{PrefixSearch, SharedTrieMap, SymbolTable};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-/// Every trie the service can serve suggestions from, keyed by name. The value
-/// stored against each word is its rank, lowest first.
 type Tries = SharedTrieMap<u32>;
 
-/// The trie used by requests that name no other one.
-const DEFAULT_TRIE: &str = "default";
+const DEFAULT_SCOPE: &str = "default";
 
-/// Where the suggest endpoint is served from.
-const SUGGEST_PATH: &str = "/api/v1/suggest";
+macro_rules! root_path { () => { "/api/v1/" } }
 
-/// How many suggestions a request gets when it asks for no particular number.
+const SUGGEST_PATH: &str = concat!(root_path!(), "suggest");
+
 const DEFAULT_LIMIT: usize = 10;
 
 const MAX_LIMIT: usize = 100;
 
-/// Builds the shared map and seeds the default trie.
 fn build_tries() -> Tries {
     let tries = Tries::new();
 
-    let default = tries.get_or_create(DEFAULT_TRIE);
+    let default = tries.get_or_create(DEFAULT_SCOPE);
     {
         let mut trie = default.write().unwrap();
         for (rank, word) in ["sea", "shell", "shore"].iter().enumerate() {
@@ -50,23 +47,15 @@ async fn index() -> HttpResponse {
 #[derive(serde::Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 struct SuggestQuery {
-    /// Prefix to complete. An empty prefix matches every word.
     q: String,
-    /// Which trie to search. Defaults to [`DEFAULT_TRIE`].
     scope: Option<String>,
-    /// Most suggestions to return. Defaults to [`DEFAULT_LIMIT`], capped at
-    /// [`MAX_LIMIT`].
     limit: Option<usize>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct SuggestResponse {
-    /// The trie that answered, which is the default one when the request named
-    /// no scope.
     scope: String,
-    /// The prefix that was searched for.
     query: String,
-    /// Matching words, in lexicographic order.
     suggestions: Vec<String>,
 }
 
@@ -75,33 +64,27 @@ struct SuggestResponse {
     path = "/api/v1/suggest",
     params(SuggestQuery),
     responses(
-        (status = 200, description = "Words in the scoped trie starting with the prefix", body = SuggestResponse),
-        (status = 404, description = "No trie is registered under that scope"),
-        (status = 500, description = "The default trie is not registered"),
+        (status = 200, description = "Suggestions starting with the prefix", body = SuggestResponse),
+        (status = 404, description = "Invalid scope"),
+        (status = 500, description = "Server error"),
     )
 )]
 async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> HttpResponse {
-    let scope = query.scope.as_deref().unwrap_or(DEFAULT_TRIE);
 
-    // Deliberately not `get_or_create`: that would let any request register a
-    // trie under a name of its choosing, growing the map without bound
-    let Some(trie) = tries.get(scope) else {
-        return if scope == DEFAULT_TRIE {
-            // Seeded at startup, so its absence is a server-side fault rather
-            // than a query that simply named the wrong trie
-            HttpResponse::InternalServerError().body("no default trie")
-        } else {
-            HttpResponse::NotFound().body(format!("unknown scope: {scope}"))
-        };
-    };
+    let scope = query.scope.as_deref().unwrap_or(DEFAULT_SCOPE);
+
+    if !tries.names().contains(&scope.to_string()) {
+        return HttpResponse::NotFound().body("Unknown scope");
+    }
+
+    let trie= tries.get(scope).unwrap();
 
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    // The read guard is taken and dropped inside this statement: never held
-    // across an `.await`, and never blocking a writer for longer than the scan
+
     let suggestions: Vec<String> = trie
         .read()
         .unwrap()
-        .get_keys_with_prefix(&query.q)
+        .get_keys_with_prefix(&query.q) // We're using direct search for small tries. We need a cache in tries for large searches
         .into_iter()
         .take(limit)
         .collect();
@@ -113,7 +96,6 @@ async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> Ht
     })
 }
 
-/// Registers the routes. Shared with the tests so they exercise the real ones.
 fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/", web::get().to(index))
         .route(SUGGEST_PATH, web::get().to(suggest));
@@ -121,10 +103,6 @@ fn configure(cfg: &mut web::ServiceConfig) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Built before the workers start, not inside the closure below:
-    // `HttpServer::new` runs that closure once per worker thread, so building
-    // the map there would give every worker its own. `web::Data` puts it behind
-    // an `Arc` that the workers share.
     let tries = web::Data::new(build_tries());
 
     HttpServer::new(move || {
@@ -153,9 +131,9 @@ mod tests {
     fn default_trie_is_seeded() {
         let tries = build_tries();
 
-        assert_eq!(tries.names(), [DEFAULT_TRIE]);
+        assert_eq!(tries.names(), [DEFAULT_SCOPE]);
 
-        let default = tries.get(DEFAULT_TRIE).unwrap();
+        let default = tries.get(DEFAULT_SCOPE).unwrap();
         let trie = default.read().unwrap();
 
         assert_eq!(trie.get_all_keys(), ["sea", "shell", "shore"]);

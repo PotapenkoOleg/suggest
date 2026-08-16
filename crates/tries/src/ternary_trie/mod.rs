@@ -218,7 +218,7 @@ impl<E: Clone> TernarySearchTrie<E> {
             return false;
         }
 
-        let mut was_deleted = false;
+        let was_deleted;
         let current_char = key[pos];
 
         {
