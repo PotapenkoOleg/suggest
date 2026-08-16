@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::string::ToString;
 use actix_web::{App, HttpResponse, HttpServer, web};
 use serde::Serialize;
@@ -17,18 +18,58 @@ const DEFAULT_LIMIT: usize = 10;
 
 const MAX_LIMIT: usize = 100;
 
-fn build_tries() -> Tries {
+/// Supplies the words a trie is seeded with, borrowed from wherever the
+/// implementation holds them.
+trait TrieLoader {
+    fn load(&self) -> impl Iterator<Item = &str>;
+}
+
+/// Loads a word per line from a file.
+struct FileTrieLoader {
+    contents: String,
+}
+
+impl FileTrieLoader {
+    /// Reads the file. The I/O happens here rather than in `load` because
+    /// `load` is synchronous and hands out borrows of what was read.
+    async fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let contents = tokio::fs::read_to_string(path).await?;
+        Ok(FileTrieLoader { contents })
+    }
+}
+
+impl TrieLoader for FileTrieLoader {
+    fn load(&self) -> impl Iterator<Item = &str> {
+        // Borrowed from the one buffer read above, so no per-word allocation:
+        // `trim` reslices rather than copying. Indentation and trailing spaces
+        // would otherwise become part of the key and break prefix search
+        self.contents
+            .lines()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+    }
+}
+
+/// Words for the default scope, resolved against the working directory.
+const DEFAULT_SCOPE_FILE: &str = "src/default.txt";
+
+/// Fails rather than starting with an empty default scope, since a service that
+/// answers every query with nothing looks healthy while being useless.
+async fn build_tries() -> std::io::Result<Tries> {
     let tries = Tries::new();
+    let loader = FileTrieLoader::open(DEFAULT_SCOPE_FILE).await?;
 
     let default = tries.get_or_create(DEFAULT_SCOPE);
     {
+        // No `.await` inside: the write guard is released before the caller
+        // can suspend
         let mut trie = default.write().unwrap();
-        for (rank, word) in ["sea", "shell", "shore"].iter().enumerate() {
+        for (rank, word) in loader.load().enumerate() {
             trie.put(word.to_string(), rank as u32);
         }
     }
 
-    tries
+    Ok(tries)
 }
 
 #[derive(OpenApi)]
@@ -120,7 +161,7 @@ fn configure(cfg: &mut web::ServiceConfig) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let tries = web::Data::new(build_tries());
+    let tries = web::Data::new(build_tries().await?);
 
     HttpServer::new(move || {
         App::new()
@@ -144,18 +185,23 @@ mod tests {
     use actix_web::http::StatusCode;
     use actix_web::test as actix_test;
 
-    #[test]
-    fn default_trie_is_seeded() {
-        let tries = build_tries();
+    // Reads the real word file; `cargo test` runs with the package root as the
+    // working directory, the same place the binary expects it. Asserted by
+    // property rather than by content, so editing the word list cannot break it
+    #[actix_web::test]
+    async fn default_trie_is_seeded_from_the_word_file() {
+        let tries = build_tries().await.unwrap();
 
         assert_eq!(tries.names(), [DEFAULT_SCOPE]);
 
         let default = tries.get(DEFAULT_SCOPE).unwrap();
         let trie = default.read().unwrap();
+        let keys = trie.get_all_keys();
 
-        assert_eq!(trie.get_all_keys(), ["sea", "shell", "shore"]);
-        assert_eq!(trie.get_keys_with_prefix("sh"), ["shell", "shore"]);
-        assert_eq!(trie.get("sea"), Some(0));
+        assert!(!keys.is_empty());
+        // Padding in the file must not survive into the keys, or no prefix
+        // query would ever match
+        assert!(keys.iter().all(|key| key.trim() == key));
     }
 
     #[test]
@@ -168,10 +214,116 @@ mod tests {
         assert_eq!(ranker.rank(candidates.clone()), candidates);
     }
 
+    // Proves the signature can actually be implemented: the returned iterator
+    // borrows from the loader, which is the part a `&str` return has to get right
+    #[test]
+    fn trie_loader_yields_borrowed_words() {
+        struct Words(Vec<String>);
+
+        impl TrieLoader for Words {
+            fn load(&self) -> impl Iterator<Item = &str> {
+                self.0.iter().map(String::as_str)
+            }
+        }
+
+        let words = Words(vec!["sea".to_string(), "shore".to_string()]);
+
+        assert_eq!(words.load().collect::<Vec<_>>(), ["sea", "shore"]);
+    }
+
+    // Takes the loader through the trait rather than the concrete type
+    fn words_of(loader: &impl TrieLoader) -> Vec<&str> {
+        loader.load().collect()
+    }
+
+    async fn write_temp_file(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        tokio::fs::write(&path, contents).await.unwrap();
+        path
+    }
+
+    #[actix_web::test]
+    async fn file_trie_loader_reads_a_word_per_line() {
+        let path = write_temp_file("suggest-loader-words.txt", "sea\nshell\nshore\n").await;
+
+        let loader = FileTrieLoader::open(&path).await.unwrap();
+
+        assert_eq!(words_of(&loader), ["sea", "shell", "shore"]);
+
+        tokio::fs::remove_file(&path).await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn file_trie_loader_trims_padding_and_skips_blank_lines() {
+        let path = write_temp_file("suggest-loader-padded.txt", "\tId  \n\n  TradeDate\n").await;
+
+        let loader = FileTrieLoader::open(&path).await.unwrap();
+
+        assert_eq!(words_of(&loader), ["Id", "TradeDate"]);
+
+        tokio::fs::remove_file(&path).await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn file_trie_loader_reads_an_empty_file_as_no_words() {
+        let path = write_temp_file("suggest-loader-empty.txt", "").await;
+
+        let loader = FileTrieLoader::open(&path).await.unwrap();
+
+        assert_eq!(words_of(&loader), Vec::<&str>::new());
+
+        tokio::fs::remove_file(&path).await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn file_trie_loader_reports_a_missing_file() {
+        let path = std::env::temp_dir().join("suggest-loader-does-not-exist.txt");
+
+        // `unwrap_err` would need `FileTrieLoader: Debug`, which it has no
+        // other reason to be
+        let Err(error) = FileTrieLoader::open(&path).await else {
+            panic!("reading a missing file should fail");
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[actix_web::test]
+    async fn file_trie_loader_feeds_a_trie() {
+        let path = write_temp_file("suggest-loader-trie.txt", "shore\nsea\nshell").await;
+
+        let loader = FileTrieLoader::open(&path).await.unwrap();
+        let tries = Tries::new();
+        let scope = tries.get_or_create("file");
+        {
+            let mut trie = scope.write().unwrap();
+            for (rank, word) in loader.load().enumerate() {
+                trie.put(word.to_string(), rank as u32);
+            }
+        }
+
+        assert_eq!(
+            scope.read().unwrap().get_all_keys(),
+            ["sea", "shell", "shore"]
+        );
+
+        tokio::fs::remove_file(&path).await.unwrap();
+    }
+
     // The running service seeds only the default trie, so the scopes a request
     // can select are registered here instead.
     fn test_tries() -> Tries {
-        let tries = build_tries();
+        let tries = Tries::new();
+
+        // Seeded in memory rather than from `DEFAULT_SCOPE_FILE`, so the
+        // endpoint tests assert on words they control
+        let default = tries.get_or_create(DEFAULT_SCOPE);
+        {
+            let mut trie = default.write().unwrap();
+            for (rank, word) in ["sea", "shell", "shore"].iter().enumerate() {
+                trie.put(word.to_string(), rank as u32);
+            }
+        }
 
         let fruit = tries.get_or_create("fruit");
         {
