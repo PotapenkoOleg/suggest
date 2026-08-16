@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::string::ToString;
+use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use actix_web::{App, HttpResponse, HttpServer, web};
 use serde::Serialize;
 use tries::{PrefixSearch, SharedTrieMap, SymbolTable};
@@ -129,7 +130,11 @@ async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> Ht
     let scope = query.scope.as_deref().unwrap_or(DEFAULT_SCOPE);
 
     if !tries.names().contains(&scope.to_string()) {
-        return HttpResponse::NotFound().body("Unknown scope");
+        // Also on the error path: without the header a browser cannot read the
+        // response at all, so the caller sees a CORS failure instead of a 404
+        return HttpResponse::NotFound()
+            .insert_header((ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+            .body("Unknown scope");
     }
 
     let trie= tries.get(scope).unwrap();
@@ -147,11 +152,15 @@ async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> Ht
     let ranker: &dyn Ranker = &DefaultRanker;
     let suggestions = ranker.rank(suggestions);
 
-    HttpResponse::Ok().json(SuggestResponse {
-        scope: scope.to_string(),
-        query: query.q.clone(),
-        suggestions,
-    })
+    // Open to any origin: the endpoint is read-only, unauthenticated, and sends
+    // no cookies, so there is no per-caller state for another site to reach
+    HttpResponse::Ok()
+        .insert_header((ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+        .json(SuggestResponse {
+            scope: scope.to_string(),
+            query: query.q.clone(),
+            suggestions,
+        })
 }
 
 fn configure(cfg: &mut web::ServiceConfig) {
@@ -441,6 +450,29 @@ mod tests {
 
         let response: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(response["suggestions"].as_array().unwrap().len(), MAX_LIMIT);
+    }
+
+    #[actix_web::test]
+    async fn suggest_allows_any_origin() {
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_tries()))
+                .configure(configure),
+        )
+        .await;
+
+        // Both the hit and the miss, since a browser needs the header to read
+        // either one
+        for uri in ["/api/v1/suggest?q=s", "/api/v1/suggest?q=s&scope=nope"] {
+            let request = actix_test::TestRequest::get().uri(uri).to_request();
+            let response = actix_test::call_service(&app, request).await;
+            let origin = response
+                .headers()
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|value| value.to_str().unwrap().to_string());
+
+            assert_eq!(origin.as_deref(), Some("*"), "no CORS header on {uri}");
+        }
     }
 
     #[actix_web::test]
