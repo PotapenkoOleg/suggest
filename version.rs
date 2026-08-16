@@ -1,0 +1,10 @@
+pub const PRODUCT_NAME: &str = "SUGGEST";
+pub const VERSION_MAJOR: i32 = 0;
+pub const VERSION_MINOR: i32 = 1;
+pub const VERSION_PATCH: i32 = 0;
+pub const VERSION_ALIAS: &str = "Nashville";
+pub const COPYRIGHT: &str = "Oleg Potapenko";
+pub const COPYRIGHT_YEARS: &str = "2026";
+pub const LICENSE: &str = "MIT";
+pub const LINK: &str = "https://github.com/PotapenkoOleg/suggest";
+pub const API_VERSION: &str = "v1";

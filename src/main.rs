@@ -14,6 +14,8 @@ const DEFAULT_TRIE: &str = "default";
 /// How many suggestions a request gets when it asks for no particular number.
 const DEFAULT_LIMIT: usize = 10;
 
+const MAX_LIMIT: usize = 100;
+
 /// Builds the shared map and seeds the default trie.
 fn build_tries() -> Tries {
     let tries = Tries::new();
