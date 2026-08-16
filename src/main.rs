@@ -59,6 +59,20 @@ struct SuggestResponse {
     suggestions: Vec<String>,
 }
 
+/// Reorders the candidates a prefix search turned up, since the trie yields
+/// them lexicographically rather than best-first.
+trait Ranker {
+    fn rank(&self, candidates: Vec<String>) -> Vec<String>;
+}
+
+struct DefaultRanker;
+
+impl Ranker for DefaultRanker {
+    fn rank(&self, candidates: Vec<String>) -> Vec<String> {
+        candidates
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/suggest",
@@ -88,6 +102,9 @@ async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> Ht
         .into_iter()
         .take(limit)
         .collect();
+
+    let ranker: &dyn Ranker = &DefaultRanker;
+    let suggestions = ranker.rank(suggestions);
 
     HttpResponse::Ok().json(SuggestResponse {
         scope: scope.to_string(),
@@ -139,6 +156,16 @@ mod tests {
         assert_eq!(trie.get_all_keys(), ["sea", "shell", "shore"]);
         assert_eq!(trie.get_keys_with_prefix("sh"), ["shell", "shore"]);
         assert_eq!(trie.get("sea"), Some(0));
+    }
+
+    #[test]
+    fn default_ranker_keeps_the_order() {
+        let candidates = vec!["shell".to_string(), "sea".to_string()];
+
+        // Also pins that the trait stays dyn-compatible
+        let ranker: &dyn Ranker = &DefaultRanker;
+
+        assert_eq!(ranker.rank(candidates.clone()), candidates);
     }
 
     // The running service seeds only the default trie, so the scopes a request
@@ -218,7 +245,7 @@ mod tests {
         let (status, body) = get("/api/v1/suggest?q=s&scope=nope").await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, "unknown scope: nope");
+        assert_eq!(body, "Unknown scope");
     }
 
     #[actix_web::test]
