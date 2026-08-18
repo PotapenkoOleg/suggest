@@ -1,0 +1,9 @@
+[package]
+name = "spell-distance"
+authors = ["Oleg Potapenko"]
+version = "1.0.0"
+license = "MIT"
+description = "Edit distance between two sequences - restricted Damerau-Levenshtein"
+edition = "2024"
+
+[dependencies]
