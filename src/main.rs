@@ -103,7 +103,7 @@ async fn build_tries() -> std::io::Result<Tries> {
             // can suspend
             let mut trie = handle.write().unwrap();
             for (rank, word) in loader.load().enumerate() {
-                trie.put(word.to_string(), rank as u32);
+                trie.put(word.to_string().to_lowercase(), rank as u32);
             }
         }
     }
