@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::string::ToString;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use actix_web::{App, HttpResponse, HttpServer, web};
 use serde::Serialize;
@@ -89,15 +89,24 @@ impl TrieLoader for FileTrieLoader {
 /// One word file per scope, resolved against the working directory.
 const DATA_DIR: &str = "src/data";
 
-/// Thread-safe map from the lower-cased key a trie stores back to the word as
-/// it is spelled in the word file, so a case-insensitive search can still
+/// One scope's spellings: each lower-cased key its trie stores, mapped back to
+/// the word as the file spells it, so a case-insensitive search can still
 /// answer with `TradeDate` rather than `tradedate`.
+type ScopeWords = Arc<RwLock<HashMap<String, String>>>;
+
+/// The spellings of every scope, keyed the way [`Tries`] keys its tries.
+///
+/// Scoped rather than shared: two scopes may spell the same word differently,
+/// and each has to answer with its own. Locking follows [`SharedTrieMap`] -
+/// the registry lock is held only long enough to clone a handle out of it, so
+/// one scope's lookups do not block another's.
 ///
 /// Every method takes `&self`, so one instance serves every worker thread
-/// behind a single [`web::Data`] rather than being cloned per request.
+/// behind a single [`web::Data`] rather than being cloned per request; each
+/// one handles a poisoned lock by panicking, the way the tries do.
 #[derive(Default)]
 struct OriginalWords {
-    words: RwLock<HashMap<String, String>>,
+    scopes: RwLock<HashMap<String, ScopeWords>>,
 }
 
 impl OriginalWords {
@@ -105,28 +114,41 @@ impl OriginalWords {
         Self::default()
     }
 
-    /// Records `word` under its lower-cased form and hands that form back, so
-    /// the caller can use it as the trie key without lower-casing twice.
-    fn insert(&self, word: &str) -> String {
-        let key = word.to_lowercase();
-        // The only two places poisoning is handled, so the policy can be
-        // changed in one edit
-        self.words
-            .write()
-            .expect("word map lock poisoned")
-            .insert(key.clone(), word.to_string());
-
-        key
+    /// Returns the spellings of `scope`, registering an empty set first if the
+    /// scope has none yet.
+    fn get_or_create(&self, scope: &str) -> ScopeWords {
+        Arc::clone(
+            self.scopes
+                .write()
+                .expect("word map lock poisoned")
+                .entry(scope.to_string())
+                .or_default(),
+        )
     }
 
-    /// Returns the original spelling of `key`, or `None` if nothing was
-    /// recorded under it.
-    fn get(&self, key: &str) -> Option<String> {
-        self.words
+    /// Returns the spellings of `scope`, or `None` if the scope has none.
+    fn get(&self, scope: &str) -> Option<ScopeWords> {
+        self.scopes
             .read()
             .expect("word map lock poisoned")
-            .get(key)
-            .cloned()
+            .get(scope)
+            .map(Arc::clone)
+    }
+
+    /// Replaces every key with the word `scope` recorded for it. A key with no
+    /// spelling recorded - or a scope with none at all - stands in for itself,
+    /// so a suggestion is never dropped for want of an entry.
+    fn spell(&self, scope: &str, keys: Vec<String>) -> Vec<String> {
+        let Some(spellings) = self.get(scope) else {
+            return keys;
+        };
+
+        // Locked once for the whole answer rather than once per key
+        let spellings = spellings.read().expect("word map lock poisoned");
+
+        keys.into_iter()
+            .map(|key| spellings.get(&key).cloned().unwrap_or(key))
+            .collect()
     }
 }
 
@@ -142,16 +164,22 @@ async fn build_tries() -> std::io::Result<(Tries, OriginalWords)> {
         let loader = FileTrieLoader::open(Path::new(DATA_DIR).join(format!("{scope}.txt"))).await?;
 
         // Lower-cased so a request spells the scope the same way whatever the
-        // casing of the file happens to be
-        let handle = tries.get_or_create(&scope.to_lowercase());
+        // casing of the file happens to be. One key, registered in both: the
+        // words of a scope are looked up under the name its trie has
+        let scope = scope.to_lowercase();
+        let handle = tries.get_or_create(&scope);
+        let spellings = words.get_or_create(&scope);
         {
-            // No `.await` inside: the write guard is released before the caller
-            // can suspend
+            // No `.await` inside: the write guards are released before the
+            // caller can suspend
             let mut trie = handle.write().unwrap();
+            let mut spellings = spellings.write().unwrap();
             for (rank, word) in loader.load().enumerate() {
                 // Keyed lower-cased so a prefix matches whatever the caller
                 // typed; the spelling from the file is what the answer carries
-                trie.put(words.insert(word), rank as u32);
+                let key = word.to_lowercase();
+                spellings.insert(key.clone(), word.to_string());
+                trie.put(key, rank as u32);
             }
         }
     }
@@ -256,12 +284,9 @@ async fn suggest(
     let suggestions = ranker.rank(suggestions);
 
     // Ranked as keys, answered as words: the lower-cased key is what the trie
-    // holds, the file's spelling is what the caller wants to display. A key
-    // with nothing recorded stands in for itself
-    let suggestions: Vec<String> = suggestions
-        .into_iter()
-        .map(|key| words.get(&key).unwrap_or(key))
-        .collect();
+    // holds, the file's spelling is what the caller wants to display. Taken
+    // from the scope that was searched, since another may spell it differently
+    let suggestions = words.spell(scope, suggestions);
 
     // Open to any origin: the endpoint is read-only, unauthenticated, and sends
     // no cookies, so there is no per-caller state for another site to reach
@@ -329,7 +354,14 @@ mod tests {
         // Every key is searchable in lower case and answerable in the casing
         // the file used
         assert!(keys.iter().all(|key| key.to_lowercase() == *key));
-        assert!(keys.iter().all(|key| words.get(key).is_some()));
+
+        let spellings = words.spell(DEFAULT_SCOPE, keys.clone());
+        assert!(
+            spellings
+                .iter()
+                .zip(&keys)
+                .all(|(spelling, key)| spelling.to_lowercase() == *key)
+        );
     }
 
     // The file has mixed-case words, so this is the case the map exists for
@@ -337,17 +369,40 @@ mod tests {
     async fn original_words_keep_the_casing_of_the_word_file() {
         let (_, words) = build_tries().await.unwrap();
 
-        assert_eq!(words.get("tradedate").as_deref(), Some("TradeDate"));
+        assert_eq!(
+            words.spell(DEFAULT_SCOPE, vec!["tradedate".to_string()]),
+            ["TradeDate"]
+        );
     }
 
     #[test]
-    fn original_words_answers_with_the_recorded_spelling() {
+    fn original_words_answer_within_their_scope() {
         let words = OriginalWords::new();
 
-        assert_eq!(words.insert("TradeDate"), "tradedate");
-        assert_eq!(words.get("tradedate").as_deref(), Some("TradeDate"));
-        assert_eq!(words.get("TradeDate"), None);
-        assert_eq!(words.get("missing"), None);
+        words
+            .get_or_create("columns")
+            .write()
+            .unwrap()
+            .insert("tradedate".to_string(), "TradeDate".to_string());
+        words
+            .get_or_create("shouting")
+            .write()
+            .unwrap()
+            .insert("tradedate".to_string(), "TRADEDATE".to_string());
+
+        let key = || vec!["tradedate".to_string()];
+
+        // The same key, spelled the way each scope recorded it
+        assert_eq!(words.spell("columns", key()), ["TradeDate"]);
+        assert_eq!(words.spell("shouting", key()), ["TRADEDATE"]);
+
+        // A scope that recorded nothing, and a key it never saw, answer with
+        // what they were given rather than dropping it
+        assert_eq!(words.spell("unknown", key()), ["tradedate"]);
+        assert_eq!(
+            words.spell("columns", vec!["missing".to_string()]),
+            ["missing"]
+        );
     }
 
     // Pins the two files the crate ships with rather than the whole list, so
@@ -501,20 +556,27 @@ mod tests {
         let words = OriginalWords::new();
 
         // Seeded in memory rather than from `DATA_DIR`, so the endpoint tests
-        // assert on words they control - but keyed through the word map, the
-        // way `build_tries` does it
+        // assert on words they control - but registered in both maps, the way
+        // `build_tries` does it
         let seed = |scope: &str, seeds: &[&str]| {
             let handle = tries.get_or_create(scope);
+            let spellings = words.get_or_create(scope);
             let mut trie = handle.write().unwrap();
+            let mut spellings = spellings.write().unwrap();
             for (rank, word) in seeds.iter().enumerate() {
-                trie.put(words.insert(word), rank as u32);
+                let key = word.to_lowercase();
+                spellings.insert(key.clone(), word.to_string());
+                trie.put(key, rank as u32);
             }
         };
 
         seed(DEFAULT_SCOPE, &["sea", "shell", "shore"]);
         seed("fruit", &["apple", "apricot", "shallot"]);
-        // Mixed case, so a response has a spelling to restore
+        // Mixed case, so a response has a spelling to restore, and the same
+        // word spelled differently in each so one scope cannot answer for the
+        // other
         seed("columns", &["TradeDate", "TradePrice"]);
+        seed("shouting", &["TRADEDATE", "TRADEPRICE"]);
 
         // More words than `MAX_LIMIT`, so a request cannot ask for them all.
         // Put straight into the trie, leaving the word map without an entry
@@ -587,6 +649,23 @@ mod tests {
         assert_eq!(
             body,
             r#"{"scope":"columns","query":"trade","suggestions":["TradeDate","TradePrice"]}"#
+        );
+    }
+
+    // Both scopes hold the same keys, so only per-scope spellings can tell the
+    // two answers apart
+    #[actix_web::test]
+    async fn suggest_answers_with_the_casing_of_the_scope_it_searched() {
+        let (_, columns) = get("/api/v1/suggest?q=trade&scope=columns").await;
+        let (_, shouting) = get("/api/v1/suggest?q=trade&scope=shouting").await;
+
+        assert_eq!(
+            columns,
+            r#"{"scope":"columns","query":"trade","suggestions":["TradeDate","TradePrice"]}"#
+        );
+        assert_eq!(
+            shouting,
+            r#"{"scope":"shouting","query":"trade","suggestions":["TRADEDATE","TRADEPRICE"]}"#
         );
     }
 
