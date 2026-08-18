@@ -1,0 +1,10 @@
+[package]
+name = "bk-tree"
+authors = ["Oleg Potapenko"]
+version = "1.0.0"
+license = "MIT"
+description = "Burkhard-Keller tree - words within an edit distance of a query, without scanning them all"
+edition = "2024"
+
+[dependencies]
+spell-distance = { path = "../spell-distance" }
