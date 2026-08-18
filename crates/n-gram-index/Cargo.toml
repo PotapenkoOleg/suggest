@@ -1,0 +1,9 @@
+[package]
+name = "n-gram-index"
+authors = ["Oleg Potapenko"]
+version = "1.0.0"
+license = "MIT"
+description = "N-gram index - the words sharing character runs with a query, boundaries marked"
+edition = "2024"
+
+[dependencies]
