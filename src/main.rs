@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::string::ToString;
+use std::sync::RwLock;
 use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use actix_web::{App, HttpResponse, HttpServer, web};
 use serde::Serialize;
@@ -87,10 +89,54 @@ impl TrieLoader for FileTrieLoader {
 /// One word file per scope, resolved against the working directory.
 const DATA_DIR: &str = "src/data";
 
+/// Thread-safe map from the lower-cased key a trie stores back to the word as
+/// it is spelled in the word file, so a case-insensitive search can still
+/// answer with `TradeDate` rather than `tradedate`.
+///
+/// Every method takes `&self`, so one instance serves every worker thread
+/// behind a single [`web::Data`] rather than being cloned per request.
+#[derive(Default)]
+struct OriginalWords {
+    words: RwLock<HashMap<String, String>>,
+}
+
+impl OriginalWords {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `word` under its lower-cased form and hands that form back, so
+    /// the caller can use it as the trie key without lower-casing twice.
+    fn insert(&self, word: &str) -> String {
+        let key = word.to_lowercase();
+        // The only two places poisoning is handled, so the policy can be
+        // changed in one edit
+        self.words
+            .write()
+            .expect("word map lock poisoned")
+            .insert(key.clone(), word.to_string());
+
+        key
+    }
+
+    /// Returns the original spelling of `key`, or `None` if nothing was
+    /// recorded under it.
+    fn get(&self, key: &str) -> Option<String> {
+        self.words
+            .read()
+            .expect("word map lock poisoned")
+            .get(key)
+            .cloned()
+    }
+}
+
+/// Builds the tries alongside the spellings their keys were lower-cased from.
+///
 /// Fails rather than starting without the default scope, since a service that
 /// answers every query with nothing looks healthy while being useless.
-async fn build_tries() -> std::io::Result<Tries> {
+async fn build_tries() -> std::io::Result<(Tries, OriginalWords)> {
     let tries = Tries::new();
+    let words = OriginalWords::new();
 
     for scope in FileTrieLoader::get_scopes() {
         let loader = FileTrieLoader::open(Path::new(DATA_DIR).join(format!("{scope}.txt"))).await?;
@@ -103,7 +149,9 @@ async fn build_tries() -> std::io::Result<Tries> {
             // can suspend
             let mut trie = handle.write().unwrap();
             for (rank, word) in loader.load().enumerate() {
-                trie.put(word.to_string().to_lowercase(), rank as u32);
+                // Keyed lower-cased so a prefix matches whatever the caller
+                // typed; the spelling from the file is what the answer carries
+                trie.put(words.insert(word), rank as u32);
             }
         }
     }
@@ -117,7 +165,7 @@ async fn build_tries() -> std::io::Result<Tries> {
         ));
     }
 
-    Ok(tries)
+    Ok((tries, words))
 }
 
 #[derive(OpenApi)]
@@ -172,7 +220,11 @@ impl Ranker for DefaultRanker {
         (status = 500, description = "Server error"),
     )
 )]
-async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> HttpResponse {
+async fn suggest(
+    tries: web::Data<Tries>,
+    words: web::Data<OriginalWords>,
+    query: web::Query<SuggestQuery>,
+) -> HttpResponse {
 
     let scope = query.scope.as_deref().unwrap_or(DEFAULT_SCOPE);
 
@@ -188,16 +240,28 @@ async fn suggest(tries: web::Data<Tries>, query: web::Query<SuggestQuery>) -> Ht
 
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
+    // Lower-cased to match the keys, which the tries are seeded with in that
+    // form, so the answer does not depend on how the caller capitalised
+    let prefix = query.q.to_lowercase();
+
     let suggestions: Vec<String> = trie
         .read()
         .unwrap()
-        .get_keys_with_prefix(&query.q) // We're using direct search for small tries. We need a cache in tries for large searches
+        .get_keys_with_prefix(&prefix) // We're using direct search for small tries. We need a cache in tries for large searches
         .into_iter()
         .take(limit)
         .collect();
 
     let ranker: &dyn Ranker = &DefaultRanker;
     let suggestions = ranker.rank(suggestions);
+
+    // Ranked as keys, answered as words: the lower-cased key is what the trie
+    // holds, the file's spelling is what the caller wants to display. A key
+    // with nothing recorded stands in for itself
+    let suggestions: Vec<String> = suggestions
+        .into_iter()
+        .map(|key| words.get(&key).unwrap_or(key))
+        .collect();
 
     // Open to any origin: the endpoint is read-only, unauthenticated, and sends
     // no cookies, so there is no per-caller state for another site to reach
@@ -217,11 +281,14 @@ fn configure(cfg: &mut web::ServiceConfig) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let tries = web::Data::new(build_tries().await?);
+    let (tries, words) = build_tries().await?;
+    let tries = web::Data::new(tries);
+    let words = web::Data::new(words);
 
     HttpServer::new(move || {
         App::new()
             .app_data(tries.clone())
+            .app_data(words.clone())
             .configure(configure)
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}")
@@ -247,7 +314,7 @@ mod tests {
     // break it
     #[actix_web::test]
     async fn default_trie_is_seeded_from_the_word_file() {
-        let tries = build_tries().await.unwrap();
+        let (tries, words) = build_tries().await.unwrap();
 
         assert!(tries.names().contains(&DEFAULT_SCOPE.to_string()));
 
@@ -259,6 +326,28 @@ mod tests {
         // Padding in the file must not survive into the keys, or no prefix
         // query would ever match
         assert!(keys.iter().all(|key| key.trim() == key));
+        // Every key is searchable in lower case and answerable in the casing
+        // the file used
+        assert!(keys.iter().all(|key| key.to_lowercase() == *key));
+        assert!(keys.iter().all(|key| words.get(key).is_some()));
+    }
+
+    // The file has mixed-case words, so this is the case the map exists for
+    #[actix_web::test]
+    async fn original_words_keep_the_casing_of_the_word_file() {
+        let (_, words) = build_tries().await.unwrap();
+
+        assert_eq!(words.get("tradedate").as_deref(), Some("TradeDate"));
+    }
+
+    #[test]
+    fn original_words_answers_with_the_recorded_spelling() {
+        let words = OriginalWords::new();
+
+        assert_eq!(words.insert("TradeDate"), "tradedate");
+        assert_eq!(words.get("tradedate").as_deref(), Some("TradeDate"));
+        assert_eq!(words.get("TradeDate"), None);
+        assert_eq!(words.get("missing"), None);
     }
 
     // Pins the two files the crate ships with rather than the whole list, so
@@ -282,7 +371,7 @@ mod tests {
     // Every word file, not only the default one, ends up queryable
     #[actix_web::test]
     async fn each_word_file_becomes_a_scope() {
-        let tries = build_tries().await.unwrap();
+        let (tries, _) = build_tries().await.unwrap();
         let names = tries.names();
 
         for scope in FileTrieLoader::get_scopes() {
@@ -405,30 +494,31 @@ mod tests {
         tokio::fs::remove_file(&path).await.unwrap();
     }
 
-    // The running service seeds only the default trie, so the scopes a request
-    // can select are registered here instead.
-    fn test_tries() -> Tries {
+    // The running service seeds the scopes from the data directory, so the
+    // ones a request can select are registered here instead.
+    fn test_tries() -> (Tries, OriginalWords) {
         let tries = Tries::new();
+        let words = OriginalWords::new();
 
-        // Seeded in memory rather than from `DEFAULT_SCOPE_FILE`, so the
-        // endpoint tests assert on words they control
-        let default = tries.get_or_create(DEFAULT_SCOPE);
-        {
-            let mut trie = default.write().unwrap();
-            for (rank, word) in ["sea", "shell", "shore"].iter().enumerate() {
-                trie.put(word.to_string(), rank as u32);
+        // Seeded in memory rather than from `DATA_DIR`, so the endpoint tests
+        // assert on words they control - but keyed through the word map, the
+        // way `build_tries` does it
+        let seed = |scope: &str, seeds: &[&str]| {
+            let handle = tries.get_or_create(scope);
+            let mut trie = handle.write().unwrap();
+            for (rank, word) in seeds.iter().enumerate() {
+                trie.put(words.insert(word), rank as u32);
             }
-        }
+        };
 
-        let fruit = tries.get_or_create("fruit");
-        {
-            let mut trie = fruit.write().unwrap();
-            for (rank, word) in ["apple", "apricot", "shallot"].iter().enumerate() {
-                trie.put(word.to_string(), rank as u32);
-            }
-        }
+        seed(DEFAULT_SCOPE, &["sea", "shell", "shore"]);
+        seed("fruit", &["apple", "apricot", "shallot"]);
+        // Mixed case, so a response has a spelling to restore
+        seed("columns", &["TradeDate", "TradePrice"]);
 
-        // More words than `MAX_LIMIT`, so a request cannot ask for them all
+        // More words than `MAX_LIMIT`, so a request cannot ask for them all.
+        // Put straight into the trie, leaving the word map without an entry
+        // for any of them: the response falls back to the key itself
         let bulk = tries.get_or_create("bulk");
         {
             let mut trie = bulk.write().unwrap();
@@ -437,13 +527,21 @@ mod tests {
             }
         }
 
-        tries
+        (tries, words)
+    }
+
+    fn test_app_data() -> (web::Data<Tries>, web::Data<OriginalWords>) {
+        let (tries, words) = test_tries();
+
+        (web::Data::new(tries), web::Data::new(words))
     }
 
     async fn get(uri: &str) -> (StatusCode, String) {
+        let (tries, words) = test_app_data();
         let app = actix_test::init_service(
             App::new()
-                .app_data(web::Data::new(test_tries()))
+                .app_data(tries)
+                .app_data(words)
                 .configure(configure),
         )
         .await;
@@ -476,6 +574,45 @@ mod tests {
         assert_eq!(
             body,
             r#"{"scope":"fruit","query":"sh","suggestions":["shallot"]}"#
+        );
+    }
+
+    // The prefix is matched in lower case, but the answer carries the spelling
+    // the words were seeded with
+    #[actix_web::test]
+    async fn suggest_answers_with_the_original_casing() {
+        let (status, body) = get("/api/v1/suggest?q=trade&scope=columns").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"columns","query":"trade","suggestions":["TradeDate","TradePrice"]}"#
+        );
+    }
+
+    #[actix_web::test]
+    async fn suggest_ignores_the_case_of_the_query() {
+        let (status, body) = get("/api/v1/suggest?q=TrAdE&scope=columns").await;
+
+        assert_eq!(status, StatusCode::OK);
+        // The query comes back as it was typed, the suggestions as they were
+        // seeded
+        assert_eq!(
+            body,
+            r#"{"scope":"columns","query":"TrAdE","suggestions":["TradeDate","TradePrice"]}"#
+        );
+    }
+
+    // Keys the word map never saw stand in for themselves rather than dropping
+    // out of the answer
+    #[actix_web::test]
+    async fn suggest_answers_with_the_key_when_no_spelling_was_recorded() {
+        let (status, body) = get("/api/v1/suggest?q=word-000&scope=bulk&limit=2").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"bulk","query":"word-000","suggestions":["word-0000","word-0001"]}"#
         );
     }
 
@@ -540,9 +677,11 @@ mod tests {
 
     #[actix_web::test]
     async fn suggest_allows_any_origin() {
+        let (tries, words) = test_app_data();
         let app = actix_test::init_service(
             App::new()
-                .app_data(web::Data::new(test_tries()))
+                .app_data(tries)
+                .app_data(words)
                 .configure(configure),
         )
         .await;
