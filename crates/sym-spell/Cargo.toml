@@ -1,0 +1,10 @@
+[package]
+name = "sym-spell"
+authors = ["Oleg Potapenko"]
+version = "1.0.0"
+license = "MIT"
+description = "SymSpell - spelling correction by symmetric deletes, ranked by distance and frequency"
+edition = "2024"
+
+[dependencies]
+spell-distance = { path = "../spell-distance" }
