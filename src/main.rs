@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::Path;
 use std::string::ToString;
 use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
@@ -23,6 +24,11 @@ const MAX_LIMIT: usize = 100;
 /// implementation holds them.
 trait TrieLoader {
     fn load(&self) -> impl Iterator<Item = &str>;
+
+    /// Names every scope the implementation can supply words for. Takes no
+    /// `self` because the caller needs the list before it has anything to load
+    /// from: the scopes decide which loaders to open, not the other way round.
+    fn get_scopes() -> Vec<String>;
 }
 
 /// Loads a word per line from a file.
@@ -49,25 +55,66 @@ impl TrieLoader for FileTrieLoader {
             .map(str::trim)
             .filter(|word| !word.is_empty())
     }
+
+    /// One scope per word file in the data directory, named after the file.
+    ///
+    /// Only `.txt` files count, and the extension is matched exactly, since
+    /// the caller reads the file back as `{scope}.txt`: a directory, a stray
+    /// `.DS_Store`, or a `.TXT` would otherwise become a scope whose file
+    /// cannot be opened on a case-sensitive filesystem, and the service would
+    /// refuse to start over it. Blocking I/O is fine here - this runs once,
+    /// before the server binds.
+    fn get_scopes() -> Vec<String> {
+        // An unreadable directory is no scopes, which `build_tries` turns into
+        // the same startup failure as a directory without the default scope
+        let Ok(entries) = std::fs::read_dir(DATA_DIR) else {
+            return Vec::new();
+        };
+
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file() && path.extension().and_then(OsStr::to_str) == Some("txt")
+            })
+            // Stems as they are on disk, so the file can be found again; the
+            // casing is dropped where the scope is registered
+            .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
+            .collect()
+    }
 }
 
-/// Words for the default scope, resolved against the working directory.
-const DEFAULT_SCOPE_FILE: &str = "src/default.txt";
+/// One word file per scope, resolved against the working directory.
+const DATA_DIR: &str = "src/data";
 
-/// Fails rather than starting with an empty default scope, since a service that
+/// Fails rather than starting without the default scope, since a service that
 /// answers every query with nothing looks healthy while being useless.
 async fn build_tries() -> std::io::Result<Tries> {
     let tries = Tries::new();
-    let loader = FileTrieLoader::open(DEFAULT_SCOPE_FILE).await?;
 
-    let default = tries.get_or_create(DEFAULT_SCOPE);
-    {
-        // No `.await` inside: the write guard is released before the caller
-        // can suspend
-        let mut trie = default.write().unwrap();
-        for (rank, word) in loader.load().enumerate() {
-            trie.put(word.to_string(), rank as u32);
+    for scope in FileTrieLoader::get_scopes() {
+        let loader = FileTrieLoader::open(Path::new(DATA_DIR).join(format!("{scope}.txt"))).await?;
+
+        // Lower-cased so a request spells the scope the same way whatever the
+        // casing of the file happens to be
+        let handle = tries.get_or_create(&scope.to_lowercase());
+        {
+            // No `.await` inside: the write guard is released before the caller
+            // can suspend
+            let mut trie = handle.write().unwrap();
+            for (rank, word) in loader.load().enumerate() {
+                trie.put(word.to_string(), rank as u32);
+            }
         }
+    }
+
+    // Covers a missing directory, an empty one, and a data directory that has
+    // word files but not the one every scope-less request falls back to
+    if tries.get(DEFAULT_SCOPE).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no {DEFAULT_SCOPE} scope in {DATA_DIR}"),
+        ));
     }
 
     Ok(tries)
@@ -194,14 +241,15 @@ mod tests {
     use actix_web::http::StatusCode;
     use actix_web::test as actix_test;
 
-    // Reads the real word file; `cargo test` runs with the package root as the
-    // working directory, the same place the binary expects it. Asserted by
-    // property rather than by content, so editing the word list cannot break it
+    // Reads the real data directory; `cargo test` runs with the package root
+    // as the working directory, the same place the binary expects it. Asserted
+    // by property rather than by content, so editing the word files cannot
+    // break it
     #[actix_web::test]
     async fn default_trie_is_seeded_from_the_word_file() {
         let tries = build_tries().await.unwrap();
 
-        assert_eq!(tries.names(), [DEFAULT_SCOPE]);
+        assert!(tries.names().contains(&DEFAULT_SCOPE.to_string()));
 
         let default = tries.get(DEFAULT_SCOPE).unwrap();
         let trie = default.read().unwrap();
@@ -211,6 +259,40 @@ mod tests {
         // Padding in the file must not survive into the keys, or no prefix
         // query would ever match
         assert!(keys.iter().all(|key| key.trim() == key));
+    }
+
+    // Pins the two files the crate ships with rather than the whole list, so
+    // adding a word file does not break it
+    #[test]
+    fn file_trie_loader_names_a_scope_per_word_file() {
+        let scopes = FileTrieLoader::get_scopes();
+
+        for expected in [DEFAULT_SCOPE, "sea"] {
+            assert!(
+                scopes.iter().any(|scope| scope.to_lowercase() == expected),
+                "no {expected} scope in {scopes:?}"
+            );
+        }
+
+        // The extension is not part of the name, or no request could name the
+        // scope without knowing how the words are stored
+        assert!(scopes.iter().all(|scope| !scope.ends_with(".txt")));
+    }
+
+    // Every word file, not only the default one, ends up queryable
+    #[actix_web::test]
+    async fn each_word_file_becomes_a_scope() {
+        let tries = build_tries().await.unwrap();
+        let names = tries.names();
+
+        for scope in FileTrieLoader::get_scopes() {
+            let scope = scope.to_lowercase();
+            assert!(names.contains(&scope), "no {scope} scope in {names:?}");
+        }
+
+        // Words from the file, not just the scope itself
+        let sea = tries.get("sea").unwrap();
+        assert!(!sea.read().unwrap().get_keys_with_prefix("s").is_empty());
     }
 
     #[test]
@@ -232,6 +314,10 @@ mod tests {
         impl TrieLoader for Words {
             fn load(&self) -> impl Iterator<Item = &str> {
                 self.0.iter().map(String::as_str)
+            }
+
+            fn get_scopes() -> Vec<String> {
+                vec!["words".to_string()]
             }
         }
 
