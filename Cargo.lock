@@ -1227,6 +1227,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "spell-distance"
+version = "1.0.0"
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1241,10 +1245,18 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sym-spell",
  "tokio",
  "tries",
  "utoipa",
  "utoipa-swagger-ui",
+]
+
+[[package]]
+name = "sym-spell"
+version = "1.0.0"
+dependencies = [
+ "spell-distance",
 ]
 
 [[package]]

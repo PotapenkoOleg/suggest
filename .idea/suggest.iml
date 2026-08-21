@@ -5,9 +5,11 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/tries/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/spell-distance/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/sym-spell/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/crates/tries/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/crates/spell-distance/target" />
+      <excludeFolder url="file://$MODULE_DIR$/crates/sym-spell/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

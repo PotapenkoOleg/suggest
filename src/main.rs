@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use actix_web::{App, HttpResponse, HttpServer, web};
 use serde::Serialize;
+use sym_spell::deletes;
 use tries::{PrefixSearch, SharedTrieMap, SymbolTable};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -152,13 +153,88 @@ impl OriginalWords {
     }
 }
 
-/// Builds the tries alongside the spellings their keys were lower-cased from.
+/// How many characters a query and a word may each drop before they have to
+/// meet on the same string, which is the number of edits the index reaches.
+const MAX_EDIT_DISTANCE: usize = 2;
+
+/// One scope's delete index: every string a word becomes when up to
+/// [`MAX_EDIT_DISTANCE`] characters are dropped from it, mapped to the words
+/// that produced it with the rank each was loaded at.
+///
+/// A `Vec` rather than one pair, because sharing a variant is the whole point:
+/// `sea` and `seat` both leave `sea` behind, and a query dropping down to it
+/// has to reach both. One pair per key would keep whichever word was inserted
+/// last and silently lose the rest.
+type ScopeVariants = Arc<RwLock<HashMap<String, Vec<(String, u32)>>>>;
+
+/// The delete variants of every scope, keyed the way [`Tries`] keys its tries.
+///
+/// Scoped for the same reason [`OriginalWords`] is: a variant only says which
+/// words a misspelling could have been, and the words of one scope are not
+/// answers for another. Locking follows the same scheme - the registry lock is
+/// held only long enough to clone a handle out of it.
+#[derive(Default)]
+struct SymSpellLookup {
+    scopes: RwLock<HashMap<String, ScopeVariants>>,
+}
+
+impl SymSpellLookup {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the variants of `scope`, registering an empty index first if
+    /// the scope has none yet.
+    fn get_or_create(&self, scope: &str) -> ScopeVariants {
+        Arc::clone(
+            self.scopes
+                .write()
+                .expect("variant map lock poisoned")
+                .entry(scope.to_string())
+                .or_default(),
+        )
+    }
+
+    /// Returns the variants of `scope`, or `None` if the scope has none.
+    // Built ahead of the search that reads it, so the binary has no caller for
+    // the two accessors below yet - the tests are what exercise them for now
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn get(&self, scope: &str) -> Option<ScopeVariants> {
+        self.scopes
+            .read()
+            .expect("variant map lock poisoned")
+            .get(scope)
+            .map(Arc::clone)
+    }
+
+    /// Returns the words of `scope` filed under `variant`, with the rank each
+    /// was loaded at, or nothing if no word of that scope leaves it behind.
+    ///
+    /// Candidates rather than answers: two words meeting on a string only says
+    /// they are worth measuring against each other.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn candidates(&self, scope: &str, variant: &str) -> Vec<(String, u32)> {
+        self.get(scope)
+            .and_then(|variants| {
+                variants
+                    .read()
+                    .expect("variant map lock poisoned")
+                    .get(variant)
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Builds the tries alongside the spellings their keys were lower-cased from
+/// and the delete variants a misspelling is looked up by.
 ///
 /// Fails rather than starting without the default scope, since a service that
 /// answers every query with nothing looks healthy while being useless.
-async fn build_tries() -> std::io::Result<(Tries, OriginalWords)> {
+async fn build_tries() -> std::io::Result<(Tries, OriginalWords, SymSpellLookup)> {
     let tries = Tries::new();
     let words = OriginalWords::new();
+    let variants = SymSpellLookup::new();
 
     for scope in FileTrieLoader::get_scopes() {
         let loader = FileTrieLoader::open(Path::new(DATA_DIR).join(format!("{scope}.txt"))).await?;
@@ -169,17 +245,51 @@ async fn build_tries() -> std::io::Result<(Tries, OriginalWords)> {
         let scope = scope.to_lowercase();
         let handle = tries.get_or_create(&scope);
         let spellings = words.get_or_create(&scope);
+        let deletions = variants.get_or_create(&scope);
         {
             // No `.await` inside: the write guards are released before the
             // caller can suspend
             let mut trie = handle.write().unwrap();
             let mut spellings = spellings.write().unwrap();
+            let mut deletions = deletions.write().unwrap();
             for (rank, word) in loader.load().enumerate() {
                 // Keyed lower-cased so a prefix matches whatever the caller
                 // typed; the spelling from the file is what the answer carries
                 let key = word.to_lowercase();
-                spellings.insert(key.clone(), word.to_string());
-                trie.put(key, rank as u32);
+                let rank = rank as u32;
+
+                // A file may list the same word twice - `InvRating` is in the
+                // default one at two lines - and the trie and the spellings
+                // both keep the later of the two. The variants have to agree:
+                // appending would offer the word once per line it was listed
+                // on, one of them ranked where nothing else ranks it
+                let repeated = spellings.insert(key.clone(), word.to_string()).is_some();
+
+                // Filed under the key rather than the spelling, since a query
+                // is lower-cased before it is dropped down to its own variants
+                // and the two sides have to meet on the same string. The word
+                // is stored as the file spells it, so a candidate needs no
+                // second lookup to be displayed
+                for variant in deletes(&key, MAX_EDIT_DISTANCE) {
+                    let candidates = deletions.entry(variant).or_default();
+
+                    // Only a repeat pays for the search, and only against the
+                    // candidates of one variant
+                    let filed = repeated
+                        .then(|| {
+                            candidates
+                                .iter_mut()
+                                .find(|(candidate, _)| candidate.to_lowercase() == key)
+                        })
+                        .flatten();
+
+                    match filed {
+                        Some(candidate) => *candidate = (word.to_string(), rank),
+                        None => candidates.push((word.to_string(), rank)),
+                    }
+                }
+
+                trie.put(key, rank);
             }
         }
     }
@@ -193,7 +303,7 @@ async fn build_tries() -> std::io::Result<(Tries, OriginalWords)> {
         ));
     }
 
-    Ok((tries, words))
+    Ok((tries, words, variants))
 }
 
 #[derive(OpenApi)]
@@ -306,14 +416,16 @@ fn configure(cfg: &mut web::ServiceConfig) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let (tries, words) = build_tries().await?;
+    let (tries, words, variants) = build_tries().await?;
     let tries = web::Data::new(tries);
     let words = web::Data::new(words);
+    let variants = web::Data::new(variants);
 
     HttpServer::new(move || {
         App::new()
             .app_data(tries.clone())
             .app_data(words.clone())
+            .app_data(variants.clone())
             .configure(configure)
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}")
@@ -339,7 +451,7 @@ mod tests {
     // break it
     #[actix_web::test]
     async fn default_trie_is_seeded_from_the_word_file() {
-        let (tries, words) = build_tries().await.unwrap();
+        let (tries, words, _) = build_tries().await.unwrap();
 
         assert!(tries.names().contains(&DEFAULT_SCOPE.to_string()));
 
@@ -367,7 +479,7 @@ mod tests {
     // The file has mixed-case words, so this is the case the map exists for
     #[actix_web::test]
     async fn original_words_keep_the_casing_of_the_word_file() {
-        let (_, words) = build_tries().await.unwrap();
+        let (_, words, _) = build_tries().await.unwrap();
 
         assert_eq!(
             words.spell(DEFAULT_SCOPE, vec!["tradedate".to_string()]),
@@ -426,7 +538,7 @@ mod tests {
     // Every word file, not only the default one, ends up queryable
     #[actix_web::test]
     async fn each_word_file_becomes_a_scope() {
-        let (tries, _) = build_tries().await.unwrap();
+        let (tries, _, _) = build_tries().await.unwrap();
         let names = tries.names();
 
         for scope in FileTrieLoader::get_scopes() {
@@ -437,6 +549,87 @@ mod tests {
         // Words from the file, not just the scope itself
         let sea = tries.get("sea").unwrap();
         assert!(!sea.read().unwrap().get_keys_with_prefix("s").is_empty());
+    }
+
+    // A word is filed under itself and under every string it becomes when
+    // characters are dropped, which is what lets a misspelling meet it
+    #[actix_web::test]
+    async fn sym_spell_lookup_files_a_word_under_its_deletes() {
+        let (tries, _, variants) = build_tries().await.unwrap();
+
+        // The first word of the default file, so its rank is pinned whatever
+        // else the file holds
+        let id = ("Id".to_string(), 0);
+
+        // Keyed by the lower-cased spelling, the form a query is dropped from
+        for variant in ["id", "i", "d", ""] {
+            assert!(
+                variants.candidates(DEFAULT_SCOPE, variant).contains(&id),
+                "Id not filed under {variant:?}"
+            );
+        }
+
+        // The rank stored is the one the trie was seeded with, so a candidate
+        // can be ordered without a second lookup
+        let default = tries.get(DEFAULT_SCOPE).unwrap();
+        assert_eq!(default.read().unwrap().get("id"), Some(id.1));
+    }
+
+    // Two scopes may hold different words, and a variant of one is no answer
+    // for the other
+    #[actix_web::test]
+    async fn sym_spell_lookup_answers_within_its_scope() {
+        let (_, _, variants) = build_tries().await.unwrap();
+
+        let seagull = ("seagull".to_string(), 1);
+
+        assert!(variants.candidates("sea", "segull").contains(&seagull));
+        assert!(!variants.candidates(DEFAULT_SCOPE, "segull").contains(&seagull));
+
+        // A scope that was never built stands in for an empty one rather than
+        // panicking, the way the word map does
+        assert!(variants.candidates("nope", "sea").is_empty());
+    }
+
+    // The default file lists `InvRating` twice, so the index has to agree with
+    // the trie about which of the two ranks the word has
+    #[actix_web::test]
+    async fn sym_spell_lookup_files_a_repeated_word_once() {
+        let (tries, _, variants) = build_tries().await.unwrap();
+
+        let key = "invrating";
+        let candidates = variants.candidates(DEFAULT_SCOPE, key);
+        let filed: Vec<_> = candidates
+            .iter()
+            .filter(|(word, _)| word.to_lowercase() == key)
+            .collect();
+
+        assert_eq!(filed.len(), 1, "{key} filed more than once: {candidates:?}");
+
+        let default = tries.get(DEFAULT_SCOPE).unwrap();
+        assert_eq!(default.read().unwrap().get(key), Some(filed[0].1));
+    }
+
+    // Nothing is filed further out than the index reaches: that bound is what
+    // keeps the map to a size the process can hold
+    #[actix_web::test]
+    async fn sym_spell_lookup_reaches_exactly_the_max_distance() {
+        let (_, _, variants) = build_tries().await.unwrap();
+
+        let deletions = variants.get(DEFAULT_SCOPE).unwrap();
+        let deletions = deletions.read().unwrap();
+        assert!(!deletions.is_empty());
+
+        for (variant, candidates) in deletions.iter() {
+            for (word, _) in candidates {
+                let key = word.to_lowercase();
+                assert!(
+                    deletes(&key, MAX_EDIT_DISTANCE).contains(variant),
+                    "{word} filed under {variant:?}, which is more than \
+                     {MAX_EDIT_DISTANCE} deletes away"
+                );
+            }
+        }
     }
 
     #[test]
