@@ -1245,6 +1245,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "spell-distance",
  "sym-spell",
  "tokio",
  "tries",

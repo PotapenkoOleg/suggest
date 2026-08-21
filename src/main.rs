@@ -1,6 +1,7 @@
 use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use actix_web::{App, HttpResponse, HttpServer, web};
 use serde::Serialize;
+use spell_distance::distance;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -26,6 +27,16 @@ const SUGGEST_PATH: &str = concat!(root_path!(), "suggest");
 const DEFAULT_LIMIT: usize = 10;
 
 const MAX_LIMIT: usize = 100;
+
+/// The longest query worth correcting, in characters.
+///
+/// Dropping characters costs a variant per pair of positions, so the work a
+/// correction does grows with the square of what was typed - and a caller can
+/// type as much as it likes. The cut is generous rather than tight: the longest
+/// word in the data is 35 characters, and nothing within two edits of a query
+/// this long could be a word at all, so no correction is lost that would have
+/// been found.
+const MAX_CORRECTED_QUERY: usize = 128;
 
 /// Supplies the words a trie is seeded with, borrowed from wherever the
 /// implementation holds them.
@@ -200,9 +211,6 @@ impl SymSpellLookup {
     }
 
     /// Returns the variants of `scope`, or `None` if the scope has none.
-    // Built ahead of the search that reads it, so the binary has no caller for
-    // the two accessors below yet - the tests are what exercise them for now
-    #[cfg_attr(not(test), allow(dead_code))]
     fn get(&self, scope: &str) -> Option<ScopeVariants> {
         self.scopes
             .read()
@@ -216,6 +224,8 @@ impl SymSpellLookup {
     ///
     /// Candidates rather than answers: two words meeting on a string only says
     /// they are worth measuring against each other.
+    // One bucket at a time, which is what a test asserts on; the search takes
+    // the whole probe through `correct` instead, under a single lock
     #[cfg_attr(not(test), allow(dead_code))]
     fn candidates(&self, scope: &str, variant: &str) -> Vec<(String, u32)> {
         self.get(scope)
@@ -227,6 +237,63 @@ impl SymSpellLookup {
                     .cloned()
             })
             .unwrap_or_default()
+    }
+
+    /// Returns the words of `scope` that `key` could have been a misspelling
+    /// of, nearest first and the earliest-ranked among words equally near.
+    ///
+    /// `key` is dropped down to the same variants its words were filed under,
+    /// so the two sides meet: a substitution by dropping the character that
+    /// differs on each side, an insertion by dropping the one side has and the
+    /// other has not, a transposition by dropping either of the two swapped.
+    /// The variants of `key` include `key` itself, so a word spelled correctly
+    /// meets its own entry.
+    ///
+    /// Sharing a variant only nominates a word - `sea` and `sets` both leave
+    /// `se` behind - so every candidate is measured before it is offered, and
+    /// what comes back is what comparing `key` to every word would have found.
+    fn correct(&self, scope: &str, key: &str, max_distance: usize) -> Vec<(String, u32)> {
+        let Some(variants) = self.get(scope) else {
+            return Vec::new();
+        };
+
+        // Deduplicated before anything is measured: one word is filed under as
+        // many variants as it has ways of losing characters, and the distance
+        // is the expensive part. The rank comes along because the answer is
+        // ordered by it, and is the same wherever the word was found
+        let candidates: HashMap<String, u32> = {
+            // Locked once for the whole probe rather than once per variant
+            let variants = variants.read().expect("variant map lock poisoned");
+
+            deletes(key, max_distance)
+                .iter()
+                .filter_map(|variant| variants.get(variant))
+                .flatten()
+                .cloned()
+                .collect()
+        };
+
+        let mut corrections: Vec<(usize, u32, String)> = candidates
+            .into_iter()
+            .filter_map(|(word, rank)| {
+                // Against the lower-cased spelling, since `key` arrives that
+                // way: measuring against the file's casing would count every
+                // capital as a substitution and throw the word out
+                let measured = distance(key, &word.to_lowercase());
+
+                (measured <= max_distance).then_some((measured, rank, word))
+            })
+            .collect();
+
+        // Nearest first, then the earliest of the words equally near - the
+        // files are written commonest first - then alphabetically, so the
+        // answer does not depend on the order the map happened to yield
+        corrections.sort();
+
+        corrections
+            .into_iter()
+            .map(|(_, rank, word)| (word, rank))
+            .collect()
     }
 }
 
@@ -357,7 +424,7 @@ impl Ranker for DefaultRanker {
     path = "/api/v1/suggest",
     params(SuggestQuery),
     responses(
-        (status = 200, description = "Suggestions starting with the prefix", body = SuggestResponse),
+        (status = 200, description = "Suggestions starting with the prefix, or corrections of it if nothing does", body = SuggestResponse),
         (status = 404, description = "Invalid scope"),
         (status = 500, description = "Server error"),
     )
@@ -365,6 +432,7 @@ impl Ranker for DefaultRanker {
 async fn suggest(
     tries: web::Data<Tries>,
     words: web::Data<OriginalWords>,
+    variants: web::Data<SymSpellLookup>,
     query: web::Query<SuggestQuery>,
 ) -> HttpResponse {
     let scope = query.scope.as_deref().unwrap_or(DEFAULT_SCOPE);
@@ -408,9 +476,34 @@ async fn suggest(
             });
     }
 
-    HttpResponse::NotFound()
+    // Unhappy path: nothing in the scope starts with what was typed, so it is
+    // read as a misspelling rather than as a prefix. Answered rather than
+    // refused - a caller mid-word has a well-formed query that simply has no
+    // completion, and 404 is what an unknown scope means here
+    let suggestions = if prefix.chars().count() > MAX_CORRECTED_QUERY {
+        // Bounded before the variants are built rather than after, since
+        // building them is the cost
+        Vec::new()
+    } else {
+        variants
+            .correct(scope, &prefix, MAX_EDIT_DISTANCE)
+            .into_iter()
+            // Ordered before it is cut, or a nearer correction further down
+            // the map would be the one dropped
+            .take(limit)
+            // Filed under the key but stored as the file spells it, so the
+            // answer needs no second lookup the way the prefix path does
+            .map(|(word, _)| word)
+            .collect()
+    };
+
+    HttpResponse::Ok()
         .insert_header((ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
-        .body("Unknown scope")
+        .json(SuggestResponse {
+            scope: scope.to_string(),
+            query: query.q.clone(),
+            suggestions,
+        })
 }
 
 fn configure(cfg: &mut web::ServiceConfig) {
@@ -752,22 +845,32 @@ mod tests {
 
     // The running service seeds the scopes from the data directory, so the
     // ones a request can select are registered here instead.
-    fn test_tries() -> (Tries, OriginalWords) {
+    fn test_tries() -> (Tries, OriginalWords, SymSpellLookup) {
         let tries = Tries::new();
         let words = OriginalWords::new();
+        let variants = SymSpellLookup::new();
 
         // Seeded in memory rather than from `DATA_DIR`, so the endpoint tests
-        // assert on words they control - but registered in both maps, the way
-        // `build_tries` does it
+        // assert on words they control - but registered in all three maps, the
+        // way `build_tries` does it
         let seed = |scope: &str, seeds: &[&str]| {
             let handle = tries.get_or_create(scope);
             let spellings = words.get_or_create(scope);
+            let deletions = variants.get_or_create(scope);
             let mut trie = handle.write().unwrap();
             let mut spellings = spellings.write().unwrap();
+            let mut deletions = deletions.write().unwrap();
             for (rank, word) in seeds.iter().enumerate() {
                 let key = word.to_lowercase();
+                let rank = rank as u32;
+                for variant in deletes(&key, MAX_EDIT_DISTANCE) {
+                    deletions
+                        .entry(variant)
+                        .or_default()
+                        .push((word.to_string(), rank));
+                }
                 spellings.insert(key.clone(), word.to_string());
-                trie.put(key, rank as u32);
+                trie.put(key, rank);
             }
         };
 
@@ -790,21 +893,30 @@ mod tests {
             }
         }
 
-        (tries, words)
+        (tries, words, variants)
     }
 
-    fn test_app_data() -> (web::Data<Tries>, web::Data<OriginalWords>) {
-        let (tries, words) = test_tries();
+    fn test_app_data() -> (
+        web::Data<Tries>,
+        web::Data<OriginalWords>,
+        web::Data<SymSpellLookup>,
+    ) {
+        let (tries, words, variants) = test_tries();
 
-        (web::Data::new(tries), web::Data::new(words))
+        (
+            web::Data::new(tries),
+            web::Data::new(words),
+            web::Data::new(variants),
+        )
     }
 
     async fn get(uri: &str) -> (StatusCode, String) {
-        let (tries, words) = test_app_data();
+        let (tries, words, variants) = test_app_data();
         let app = actix_test::init_service(
             App::new()
                 .app_data(tries)
                 .app_data(words)
+                .app_data(variants)
                 .configure(configure),
         )
         .await;
@@ -923,6 +1035,131 @@ mod tests {
         );
     }
 
+    // Nothing starts with `seat`, so the query is read as a misspelling and
+    // answered with what it could have been rather than with nothing
+    #[actix_web::test]
+    async fn suggest_corrects_a_query_no_word_starts_with() {
+        let (status, body) = get("/api/v1/suggest?q=seat").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"seat","suggestions":["sea"]}"#
+        );
+    }
+
+    // `shorl` is one edit from `shore` and two from `shell`, so the nearer
+    // word comes first even though the other was seeded at a better rank
+    #[actix_web::test]
+    async fn suggest_orders_corrections_by_distance() {
+        let (status, body) = get("/api/v1/suggest?q=shorl").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"shorl","suggestions":["shore","shell"]}"#
+        );
+    }
+
+    // Both are two edits from `shale`, so the rank the words were loaded at is
+    // what separates them
+    #[actix_web::test]
+    async fn suggest_orders_equally_near_corrections_by_rank() {
+        let (status, body) = get("/api/v1/suggest?q=shale").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"shale","suggestions":["shell","shore"]}"#
+        );
+    }
+
+    // Cut after the ordering, so the limit takes the nearest rather than
+    // whichever correction was found first
+    #[actix_web::test]
+    async fn suggest_honours_the_limit_when_correcting() {
+        let (status, body) = get("/api/v1/suggest?q=shale&limit=1").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"shale","suggestions":["shell"]}"#
+        );
+    }
+
+    // A transposition, which is the edit a plain Levenshtein distance would
+    // charge twice for and rank behind a word that is genuinely further away
+    #[actix_web::test]
+    async fn suggest_corrects_a_transposition_in_the_original_casing() {
+        let (status, body) = get("/api/v1/suggest?q=tradedaet&scope=columns").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"columns","query":"tradedaet","suggestions":["TradeDate"]}"#
+        );
+    }
+
+    // A word that starts with the query is a completion, not a correction, so
+    // the prefix path answers and the nearer misspelling is not offered
+    #[actix_web::test]
+    async fn suggest_prefers_a_prefix_match_to_a_correction() {
+        let (status, body) = get("/api/v1/suggest?q=she").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            r#"{"scope":"default","query":"she","suggestions":["shell"]}"#
+        );
+    }
+
+    // Sharing a variant only nominates a word - `abxy` and `pqab` both leave
+    // `ab` behind, and they are four edits apart - so each is measured
+    #[test]
+    fn sym_spell_lookup_measures_a_candidate_before_offering_it() {
+        let variants = SymSpellLookup::new();
+        let deletions = variants.get_or_create("words");
+        {
+            let mut deletions = deletions.write().unwrap();
+            for (rank, word) in ["abxy", "pqab"].iter().enumerate() {
+                for variant in deletes(word, MAX_EDIT_DISTANCE) {
+                    deletions
+                        .entry(variant)
+                        .or_default()
+                        .push((word.to_string(), rank as u32));
+                }
+            }
+        }
+
+        // Both words are filed under `ab`, and only one survives measuring
+        assert_eq!(variants.candidates("words", "ab").len(), 2);
+        assert_eq!(
+            variants.correct("words", "abxy", MAX_EDIT_DISTANCE),
+            [("abxy".to_string(), 0)]
+        );
+
+        // A scope that was never built has nothing to correct with, the way it
+        // has nothing to spell with
+        assert!(
+            variants
+                .correct("nope", "abxy", MAX_EDIT_DISTANCE)
+                .is_empty()
+        );
+    }
+
+    // Correcting a query costs a variant per pair of positions in it, so a
+    // caller cannot make the service do that work without bound
+    #[actix_web::test]
+    async fn suggest_does_not_correct_a_query_longer_than_any_word() {
+        let query = "s".repeat(MAX_CORRECTED_QUERY + 1);
+        let (status, body) = get(&format!("/api/v1/suggest?q={query}")).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(response["suggestions"].as_array().unwrap().is_empty());
+    }
+
     #[actix_web::test]
     async fn suggest_matches_nothing_outside_the_trie() {
         let (status, body) = get("/api/v1/suggest?q=zebra").await;
@@ -957,18 +1194,23 @@ mod tests {
 
     #[actix_web::test]
     async fn suggest_allows_any_origin() {
-        let (tries, words) = test_app_data();
+        let (tries, words, variants) = test_app_data();
         let app = actix_test::init_service(
             App::new()
                 .app_data(tries)
                 .app_data(words)
+                .app_data(variants)
                 .configure(configure),
         )
         .await;
 
-        // Both the hit and the miss, since a browser needs the header to read
-        // either one
-        for uri in ["/api/v1/suggest?q=s", "/api/v1/suggest?q=s&scope=nope"] {
+        // The prefix hit, the correction, and the unknown scope, since a
+        // browser needs the header to read any of them
+        for uri in [
+            "/api/v1/suggest?q=s",
+            "/api/v1/suggest?q=seat",
+            "/api/v1/suggest?q=s&scope=nope",
+        ] {
             let request = actix_test::TestRequest::get().uri(uri).to_request();
             let response = actix_test::call_service(&app, request).await;
             let origin = response
