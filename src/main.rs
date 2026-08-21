@@ -1,11 +1,11 @@
+use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
+use actix_web::{App, HttpResponse, HttpServer, web};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::string::ToString;
 use std::sync::{Arc, RwLock};
-use actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
-use actix_web::{App, HttpResponse, HttpServer, web};
-use serde::Serialize;
 use sym_spell::deletes;
 use tries::{PrefixSearch, SharedTrieMap, SymbolTable};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -15,7 +15,11 @@ type Tries = SharedTrieMap<u32>;
 
 const DEFAULT_SCOPE: &str = "default";
 
-macro_rules! root_path { () => { "/api/v1/" } }
+macro_rules! root_path {
+    () => {
+        "/api/v1/"
+    };
+}
 
 const SUGGEST_PATH: &str = concat!(root_path!(), "suggest");
 
@@ -363,7 +367,6 @@ async fn suggest(
     words: web::Data<OriginalWords>,
     query: web::Query<SuggestQuery>,
 ) -> HttpResponse {
-
     let scope = query.scope.as_deref().unwrap_or(DEFAULT_SCOPE);
 
     if !tries.names().contains(&scope.to_string()) {
@@ -374,7 +377,7 @@ async fn suggest(
             .body("Unknown scope");
     }
 
-    let trie= tries.get(scope).unwrap();
+    let trie = tries.get(scope).unwrap();
 
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
@@ -390,23 +393,24 @@ async fn suggest(
         .take(limit)
         .collect();
 
-    let ranker: &dyn Ranker = &DefaultRanker;
-    let suggestions = ranker.rank(suggestions);
+    if !suggestions.is_empty() {
+        let ranker: &dyn Ranker = &DefaultRanker;
+        let suggestions = ranker.rank(suggestions);
 
-    // Ranked as keys, answered as words: the lower-cased key is what the trie
-    // holds, the file's spelling is what the caller wants to display. Taken
-    // from the scope that was searched, since another may spell it differently
-    let suggestions = words.spell(scope, suggestions);
+        let suggestions = words.spell(scope, suggestions);
 
-    // Open to any origin: the endpoint is read-only, unauthenticated, and sends
-    // no cookies, so there is no per-caller state for another site to reach
-    HttpResponse::Ok()
+        return HttpResponse::Ok()
+            .insert_header((ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+            .json(SuggestResponse {
+                scope: scope.to_string(),
+                query: query.q.clone(),
+                suggestions,
+            });
+    }
+
+    HttpResponse::NotFound()
         .insert_header((ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
-        .json(SuggestResponse {
-            scope: scope.to_string(),
-            query: query.q.clone(),
-            suggestions,
-        })
+        .body("Unknown scope")
 }
 
 fn configure(cfg: &mut web::ServiceConfig) {
@@ -584,7 +588,11 @@ mod tests {
         let seagull = ("seagull".to_string(), 1);
 
         assert!(variants.candidates("sea", "segull").contains(&seagull));
-        assert!(!variants.candidates(DEFAULT_SCOPE, "segull").contains(&seagull));
+        assert!(
+            !variants
+                .candidates(DEFAULT_SCOPE, "segull")
+                .contains(&seagull)
+        );
 
         // A scope that was never built stands in for an empty one rather than
         // panicking, the way the word map does
